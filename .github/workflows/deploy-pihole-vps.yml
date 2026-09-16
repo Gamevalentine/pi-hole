@@ -1,0 +1,74 @@
+name: Deploy Pi-hole to VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_firewall:
+        description: "Type FIREWALL_READY after restricting TCP/UDP 53 and TCP 8443 at the VPS/provider firewall"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Safety check
+        env:
+          CONFIRM_FIREWALL: ${{ inputs.confirm_firewall }}
+          VPS_HOST: ${{ secrets.PIHOLE_VPS_HOST }}
+          VPS_USER: ${{ secrets.PIHOLE_VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.PIHOLE_VPS_SSH_KEY }}
+          PIHOLE_ADMIN_PASSWORD: ${{ secrets.PIHOLE_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRM_FIREWALL" = "FIREWALL_READY" || { echo "Refusing deployment: firewall confirmation is missing."; exit 1; }
+          test -n "$VPS_HOST" || { echo "Missing secret PIHOLE_VPS_HOST"; exit 1; }
+          test -n "$VPS_USER" || { echo "Missing secret PIHOLE_VPS_USER"; exit 1; }
+          test -n "$VPS_SSH_KEY" || { echo "Missing secret PIHOLE_VPS_SSH_KEY"; exit 1; }
+          test -n "$PIHOLE_ADMIN_PASSWORD" || { echo "Missing secret PIHOLE_ADMIN_PASSWORD"; exit 1; }
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VPS_HOST: ${{ secrets.PIHOLE_VPS_HOST }}
+          VPS_SSH_KEY: ${{ secrets.PIHOLE_VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload deployment files
+        env:
+          VPS_HOST: ${{ secrets.PIHOLE_VPS_HOST }}
+          VPS_USER: ${{ secrets.PIHOLE_VPS_USER }}
+        run: |
+          set -euo pipefail
+          ssh "$VPS_USER@$VPS_HOST" 'mkdir -p ~/pihole'
+          scp deploy/remote/compose.yaml "$VPS_USER@$VPS_HOST:~/pihole/compose.yaml"
+
+      - name: Start Pi-hole
+        env:
+          VPS_HOST: ${{ secrets.PIHOLE_VPS_HOST }}
+          VPS_USER: ${{ secrets.PIHOLE_VPS_USER }}
+          PIHOLE_ADMIN_PASSWORD: ${{ secrets.PIHOLE_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          PW_B64="$(printf '%s' "$PIHOLE_ADMIN_PASSWORD" | base64 -w0)"
+          ssh "$VPS_USER@$VPS_HOST" "PW_B64='$PW_B64' bash -s" <<'REMOTE'
+          set -euo pipefail
+          command -v docker >/dev/null || { echo 'Docker is not installed on the VPS.'; exit 1; }
+          docker compose version >/dev/null || { echo 'Docker Compose plugin is not installed on the VPS.'; exit 1; }
+          cd ~/pihole
+          umask 077
+          printf 'PIHOLE_ADMIN_PASSWORD=%s\n' "$(printf '%s' "$PW_B64" | base64 -d)" > .env
+          docker compose pull
+          docker compose up -d
+          docker compose ps
+          REMOTE
